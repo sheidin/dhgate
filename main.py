@@ -11,6 +11,7 @@ import time
 import json
 import csv
 import re
+import sqlite3
 import requests
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
@@ -20,6 +21,7 @@ from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from urllib.parse import urljoin
 import logging
 from dotenv import load_dotenv
+from datetime import datetime
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -50,13 +52,235 @@ class DHGateScraper:
         self.driver = None
         self.session = requests.Session()
         self.headers_file = 'headers_cache.txt'  # Store in project root
+        self.db_file = 'orders.db'  # Store in project root
         
         # Create download directory if it doesn't exist
         os.makedirs(self.download_dir, exist_ok=True)
         
+        # Initialize database
+        self.init_database()
+        
         # Validate credentials
         if not self.username or not self.password:
             logger.warning("Username or password not provided. Please set DHGATE_USERNAME and DHGATE_PASSWORD in .env file or pass as parameters.")
+    
+    def init_database(self):
+        """Initialize SQLite database with orders table"""
+        try:
+            conn = sqlite3.connect(self.db_file)
+            cursor = conn.cursor()
+            
+            # Create orders table with all CSV columns plus additional fields
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS orders (
+                    order_no TEXT PRIMARY KEY,
+                    sale_amount_usd TEXT,
+                    estimated_commission TEXT,
+                    confirmed_commission TEXT,
+                    status TEXT,
+                    description TEXT,
+                    create_time TEXT,
+                    pid TEXT,
+                    tracking_source TEXT,
+                    media_id TEXT,
+                    media TEXT,
+                    customize1_id TEXT,
+                    customize2_id TEXT,
+                    country_region TEXT,
+                    final_url TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Create index on final_url for efficient querying
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_final_url 
+                ON orders(final_url)
+            ''')
+            
+            conn.commit()
+            conn.close()
+            logger.info("Database initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize database: {e}")
+    
+    def get_orders_without_final_url(self):
+        """Get orders that don't have final_url set"""
+        try:
+            conn = sqlite3.connect(self.db_file)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT * FROM orders 
+                WHERE final_url IS NULL
+                ORDER BY order_no DESC
+            ''')
+            
+            orders = cursor.fetchall()
+            # Get column names before closing connection
+            columns = [description[0] for description in cursor.description]
+            conn.close()
+            
+            # Convert to list of dictionaries
+            orders_list = []
+            for order in orders:
+                order_dict = dict(zip(columns, order))
+                orders_list.append(order_dict)
+            
+            return orders_list
+            
+        except Exception as e:
+            logger.error(f"Failed to get orders without final_url: {e}")
+            return []
+    
+    def save_orders_to_db(self, orders_collection, columns):
+        """Save orders to database, updating existing records"""
+        try:
+            conn = sqlite3.connect(self.db_file)
+            cursor = conn.cursor()
+            
+            saved_count = 0
+            updated_count = 0
+            
+            for order in orders_collection:
+                # Map CSV columns to database columns
+                order_no = order.get('Order No.', '')
+                if not order_no:
+                    continue
+                
+                # Prepare data for database
+                db_data = {
+                    'order_no': order_no,
+                    'sale_amount_usd': order.get('Sale Amount(USD)', ''),
+                    'estimated_commission': order.get('Estimated commission', ''),
+                    'confirmed_commission': order.get('Confirmed Commission', ''),
+                    'status': order.get('Status', ''),
+                    'description': order.get('Description', ''),
+                    'create_time': order.get('Create Time', ''),
+                    'pid': order.get('pid', ''),
+                    'tracking_source': order.get('tracking source', ''),
+                    'media_id': order.get('media id', ''),
+                    'media': order.get('media', ''),
+                    'customize1_id': order.get('Customize1 ID', ''),
+                    'customize2_id': order.get('Customize2 ID', ''),
+                    'country_region': order.get('Country/Region', ''),
+                    'updated_at': datetime.now().isoformat()
+                }
+                
+                # Check if order exists
+                cursor.execute('SELECT order_no FROM orders WHERE order_no = ?', (order_no,))
+                exists = cursor.fetchone()
+                
+                if exists:
+                    # Update existing record
+                    cursor.execute('''
+                        UPDATE orders SET
+                            sale_amount_usd = ?, estimated_commission = ?, confirmed_commission = ?,
+                            status = ?, description = ?, create_time = ?, pid = ?, tracking_source = ?,
+                            media_id = ?, media = ?, customize1_id = ?, customize2_id = ?,
+                            country_region = ?, updated_at = ?
+                        WHERE order_no = ?
+                    ''', (
+                        db_data['sale_amount_usd'], db_data['estimated_commission'], db_data['confirmed_commission'],
+                        db_data['status'], db_data['description'], db_data['create_time'], db_data['pid'],
+                        db_data['tracking_source'], db_data['media_id'], db_data['media'],
+                        db_data['customize1_id'], db_data['customize2_id'], db_data['country_region'],
+                        db_data['updated_at'], order_no
+                    ))
+                    updated_count += 1
+                else:
+                    # Insert new record
+                    cursor.execute('''
+                        INSERT INTO orders (
+                            order_no, sale_amount_usd, estimated_commission, confirmed_commission,
+                            status, description, create_time, pid, tracking_source, media_id, media,
+                            customize1_id, customize2_id, country_region, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        db_data['order_no'], db_data['sale_amount_usd'], db_data['estimated_commission'],
+                        db_data['confirmed_commission'], db_data['status'], db_data['description'],
+                        db_data['create_time'], db_data['pid'], db_data['tracking_source'],
+                        db_data['media_id'], db_data['media'], db_data['customize1_id'],
+                        db_data['customize2_id'], db_data['country_region'],
+                        db_data['updated_at'], db_data['updated_at']
+                    ))
+                    saved_count += 1
+            
+            conn.commit()
+            conn.close()
+            
+            logger.info(f"Database updated: {saved_count} new orders, {updated_count} updated orders")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to save orders to database: {e}")
+            return False
+    
+    def update_order_final_url(self, order_no, final_url):
+        """Update the final_url for a specific order"""
+        try:
+            conn = sqlite3.connect(self.db_file)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                UPDATE orders 
+                SET final_url = ?, updated_at = ?
+                WHERE order_no = ?
+            ''', (final_url, datetime.now().isoformat(), order_no))
+            
+            conn.commit()
+            conn.close()
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to update final_url for order {order_no}: {e}")
+            return False
+    
+    def import_existing_csv_data(self):
+        """Import existing CSV files into database on first run"""
+        try:
+            # Check if database is empty
+            conn = sqlite3.connect(self.db_file)
+            cursor = conn.cursor()
+            cursor.execute('SELECT COUNT(*) FROM orders')
+            count = cursor.fetchone()[0]
+            conn.close()
+            
+            if count > 0:
+                logger.info("Database already contains data, skipping CSV import")
+                return True
+            
+            # Look for existing CSV files in downloads directory
+            csv_files = [f for f in os.listdir(self.download_dir) if f.startswith('report_') and f.endswith('.csv')]
+            
+            if not csv_files:
+                logger.info("No existing CSV files found to import")
+                return True
+            
+            # Import the most recent CSV file
+            latest_csv = max(csv_files, key=lambda x: os.path.getctime(os.path.join(self.download_dir, x)))
+            csv_path = os.path.join(self.download_dir, latest_csv)
+            
+            logger.info(f"Importing existing CSV data from: {latest_csv}")
+            
+            with open(csv_path, 'r', encoding='utf-8') as csvfile:
+                reader = csv.DictReader(csvfile)
+                orders = list(reader)
+                
+                if orders:
+                    # Get column names from CSV
+                    columns = reader.fieldnames
+                    self.save_orders_to_db(orders, columns)
+                    logger.info(f"Successfully imported {len(orders)} orders from CSV")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to import existing CSV data: {e}")
+            return False
     
     def wait_for_network_idle(self, timeout=None, idle_time=2):
         """Wait for network activity to settle by monitoring page load state"""
@@ -377,34 +601,6 @@ class DHGateScraper:
             logger.error(f"Failed to extract auth headers: {e}")
             return False
     
-    def save_csv_report(self, orders_collection, columns):
-        """Save CSV report to downloads folder with datetime stamp"""
-        try:
-            from datetime import datetime
-            
-            # Generate filename with current datetime
-            current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-            csv_filename = f"report_{current_time}.csv"
-            csv_path = os.path.join(self.download_dir, csv_filename)
-            
-            # Write CSV file
-            with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
-                writer = csv.DictWriter(csvfile, fieldnames=columns)
-                
-                # Write header
-                writer.writeheader()
-                
-                # Write data rows
-                for order in orders_collection:
-                    writer.writerow(order)
-            
-            logger.info(f"CSV report saved: {csv_path}")
-            logger.info(f"Report contains {len(orders_collection)} orders")
-            return csv_path
-            
-        except Exception as e:
-            logger.error(f"Error saving CSV report: {e}")
-            return None
 
     def follow_all_redirects(self, url, order_id, max_redirects=10):
         """Follow all redirects using Selenium until we get the final content"""
@@ -477,9 +673,9 @@ class DHGateScraper:
                             redirect_count += 1
                             continue
                     
-                    # This appears to be the final content
-                    logger.info(f"Reached final content after {redirect_count} redirects for order {order_id}")
-                    return page_content.encode('utf-8')
+                    # This appears to be the final URL
+                    logger.info(f"Reached final URL after {redirect_count} redirects for order {order_id}: {final_url}")
+                    return final_url
                     
                 except Exception as e:
                     logger.error(f"Error navigating to {current_url} for order {order_id}: {e}")
@@ -714,72 +910,72 @@ class DHGateScraper:
                 logger.info(f"Processing {len(orders_collection)} orders")
                 logger.info(f"Available columns: {columns}")
                 
-                # Save CSV report to root folder
-                self.save_csv_report(orders_collection, columns)
+                # Save orders to database
+                self.save_orders_to_db(orders_collection, columns)
                 
-                # Update orders variable to use the collection
-                orders = orders_collection
+                # Import existing CSV data on first run
+                self.import_existing_csv_data()
+                
             else:
                 logger.warning("No orders found in CSV data")
-                orders = []
             
-            # Process each order (matching PHP script logic)
-            for k, order in enumerate(orders):
-                # Access order data using column names
-                order_id = order.get('Order No.', '')
-                amount = order.get('Sale Amount(USD)', '0')
-                subid = order.get('Customize1 ID', '')
+            # Process only orders without final_url
+            orders_to_process = self.get_orders_without_final_url()
+            logger.info(f"Found {len(orders_to_process)} orders without final_url to process")
+            
+            for order in orders_to_process:
+                # Access order data using database column names
+                order_id = order.get('order_no', '')
+                amount = order.get('sale_amount_usd', '0')
+                subid = order.get('customize1_id', '')
                 
                 # Ensure we have the required data
                 if order_id and subid:
+                    # Download the final URL with retry logic
+                    download_url = f"https://izeeto.com/conv?subid={subid}&tid={order_id}&amount={amount}"
+                    logger.info(f"Processing order {order_id}: {download_url}")
                     
-                    # Check if file already exists (like PHP: !file_exists())
-                    file_path = os.path.join(self.download_dir, order_id)
-                    if not os.path.exists(file_path):
-                        # Download the file with retry logic
-                        download_url = f"https://izeeto.com/conv?subid={subid}&tid={order_id}&amount={amount}"
-                        logger.info(f"Downloading file for order {download_url}")
-                        logger.info(f"Downloading file for order {order_id}")
-                        
-                        # Retry logic for failed downloads
-                        max_retries = 3
-                        retry_delay = 1  # seconds
-                        
-                        for attempt in range(max_retries):
-                            try:
-                                # Use follow_all_redirects to handle the download with redirects
-                                final_content = self.follow_all_redirects(download_url, order_id, max_redirects=10)
-                                
-                                if final_content:
-                                    # Save the final content
-                                    with open(file_path, 'wb') as f:
-                                        f.write(final_content)
-                                    logger.info(f"File saved after following all redirects: {file_path}")
+                    # Retry logic for failed downloads
+                    max_retries = 3
+                    retry_delay = 1  # seconds
+                    
+                    for attempt in range(max_retries):
+                        try:
+                            # Use follow_all_redirects to get the final URL
+                            final_url = self.follow_all_redirects(download_url, order_id, max_redirects=2)
+                            
+                            if final_url:
+                                # Update the order with the final URL
+                                if self.update_order_final_url(order_id, final_url):
+                                    logger.info(f"Successfully updated order {order_id} with final URL: {final_url}")
                                     break  # Success, exit retry loop
                                 else:
-                                    logger.warning(f"Could not get final content after following redirects for order {order_id}")
-                                    if attempt < max_retries - 1:
-                                        logger.info(f"Retrying download for order {order_id} (attempt {attempt + 2}/{max_retries})")
-                                        time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
-                                        continue
-                                    else:
-                                        logger.error(f"Failed to download file for order {order_id} after {max_retries} attempts")
-                                        break
-                                    
-                            except Exception as e:
-                                logger.error(f"Error downloading file for order {order_id}: {e}")
+                                    logger.error(f"Failed to update database for order {order_id}")
+                                    break
+                            else:
+                                logger.warning(f"Could not get final URL for order {order_id}")
                                 if attempt < max_retries - 1:
-                                    logger.info(f"Retrying download for order {order_id} (attempt {attempt + 2}/{max_retries})")
+                                    logger.info(f"Retrying order {order_id} (attempt {attempt + 2}/{max_retries})")
                                     time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
                                     continue
                                 else:
-                                    logger.error(f"Failed to download file for order {order_id} after {max_retries} attempts: {e}")
+                                    logger.error(f"Failed to get final URL for order {order_id} after {max_retries} attempts")
                                     break
-                        
-                        # Add a small delay between downloads to avoid overwhelming the server
-                        time.sleep(0.5)
-                    else:
-                        logger.info(f"File already exists for order {order_id}")
+                                
+                        except Exception as e:
+                            logger.error(f"Error processing order {order_id}: {e}")
+                            if attempt < max_retries - 1:
+                                logger.info(f"Retrying order {order_id} (attempt {attempt + 2}/{max_retries})")
+                                time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
+                                continue
+                            else:
+                                logger.error(f"Failed to process order {order_id} after {max_retries} attempts: {e}")
+                                break
+                    
+                    # Add a small delay between downloads to avoid overwhelming the server
+                    time.sleep(0.5)
+                else:
+                    logger.warning(f"Skipping order {order_id} - missing required data (subid: {subid})")
             
             return True
             
@@ -812,6 +1008,9 @@ class DHGateScraper:
                 if not self.login():
                     logger.error("Login failed. Exiting.")
                     return False
+            
+            # Import existing CSV data on first run
+            self.import_existing_csv_data()
             
             # Fetch orders
             if not self.fetch_orders():
