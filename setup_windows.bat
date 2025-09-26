@@ -74,3 +74,4 @@ echo 2. Run: venv\Scripts\activate.bat
 echo 3. Run: python main.py
 echo.
 pause
+

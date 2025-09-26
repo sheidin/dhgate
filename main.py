@@ -10,6 +10,7 @@ import os
 import time
 import json
 import csv
+import re
 import requests
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
@@ -40,6 +41,7 @@ class DHGateScraper:
         self.request_timeout = int(os.getenv('REQUEST_TIMEOUT', '30'))
         self.network_idle_timeout = int(os.getenv('NETWORK_IDLE_TIMEOUT', '30'))
         self.manual_auth_token = os.getenv('AUTH_TOKEN')
+        self.headless = os.getenv('HEADLESS', 'true').lower() == 'true'
         
         # Set log level from environment
         log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
@@ -79,7 +81,6 @@ class DHGateScraper:
                         # If load event has ended, check if we've been idle
                         current_time = time.time()
                         if current_time - last_activity_time >= idle_time:
-                            logger.info("Network activity has settled")
                             return True
                     else:
                         # Page is still loading, reset idle timer
@@ -201,6 +202,10 @@ class DHGateScraper:
             options.add_argument('--disable-popup-blocking')
             options.add_argument('--disable-web-security')
             options.add_argument('--allow-running-insecure-content')
+            
+            # Add headless mode if enabled
+            if self.headless:
+                options.add_argument('--headless')
             
             # Add custom Chrome options from environment
             for option in self.chrome_options:
@@ -372,6 +377,121 @@ class DHGateScraper:
             logger.error(f"Failed to extract auth headers: {e}")
             return False
     
+    def save_csv_report(self, orders_collection, columns):
+        """Save CSV report to downloads folder with datetime stamp"""
+        try:
+            from datetime import datetime
+            
+            # Generate filename with current datetime
+            current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+            csv_filename = f"report_{current_time}.csv"
+            csv_path = os.path.join(self.download_dir, csv_filename)
+            
+            # Write CSV file
+            with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=columns)
+                
+                # Write header
+                writer.writeheader()
+                
+                # Write data rows
+                for order in orders_collection:
+                    writer.writerow(order)
+            
+            logger.info(f"CSV report saved: {csv_path}")
+            logger.info(f"Report contains {len(orders_collection)} orders")
+            return csv_path
+            
+        except Exception as e:
+            logger.error(f"Error saving CSV report: {e}")
+            return None
+
+    def follow_all_redirects(self, url, order_id, max_redirects=10):
+        """Follow all redirects using Selenium until we get the final content"""
+        try:
+            # Use existing driver if available, otherwise create a new one
+            if not self.driver:
+                if not self.setup_driver():
+                    logger.error(f"Failed to setup driver for order {order_id}")
+                    return None
+            
+            current_url = url
+            redirect_count = 0
+            visited_urls = set()  # Prevent infinite loops
+            
+            while redirect_count < max_redirects:
+                if current_url in visited_urls:
+                    logger.warning(f"Circular redirect detected for order {order_id} at {current_url}")
+                    return None
+                
+                visited_urls.add(current_url)
+                logger.info(f"Following redirect {redirect_count + 1} for order {order_id}: {current_url}")
+                
+                try:
+                    # Navigate to the URL
+                    self.driver.get(current_url)
+                    
+                    # Wait for page to load
+                    time.sleep(2)
+                    
+                    # Wait for network activity to settle
+                    self.wait_for_network_idle(timeout=5)
+                    
+                    # Get the current URL after navigation
+                    final_url = self.driver.current_url
+                    
+                    # Check if URL changed (redirect happened)
+                    if final_url != current_url:
+                        logger.info(f"URL changed from {current_url} to {final_url}")
+                        current_url = final_url
+                        redirect_count += 1
+                        continue
+                    
+                    # Get page content
+                    page_content = self.driver.page_source
+                    
+                    # Check for history.back() - this means the URL is invalid
+                    if 'window.history.back()' in page_content:
+                        logger.warning(f"Received history.back() redirect for order {order_id} - URL is invalid/expired")
+                        return None
+                    
+                    # Check if this looks like a redirect page
+                    if 'redirecting' in page_content.lower() or 'window.location' in page_content:
+                        # Wait a bit more for JavaScript redirects
+                        time.sleep(3)
+                        new_url = self.driver.current_url
+                        if new_url != current_url:
+                            logger.info(f"JavaScript redirect detected: {current_url} -> {new_url}")
+                            current_url = new_url
+                            redirect_count += 1
+                            continue
+                    
+                    # Check if we're still on a redirect page
+                    if 'redirecting' in page_content.lower() and redirect_count < max_redirects:
+                        # Wait longer for complex redirects
+                        time.sleep(5)
+                        new_url = self.driver.current_url
+                        if new_url != current_url:
+                            logger.info(f"Delayed redirect: {current_url} -> {new_url}")
+                            current_url = new_url
+                            redirect_count += 1
+                            continue
+                    
+                    # This appears to be the final content
+                    logger.info(f"Reached final content after {redirect_count} redirects for order {order_id}")
+                    return page_content.encode('utf-8')
+                    
+                except Exception as e:
+                    logger.error(f"Error navigating to {current_url} for order {order_id}: {e}")
+                    return None
+            
+            logger.warning(f"Maximum redirects ({max_redirects}) reached for order {order_id}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error with Selenium for order {order_id}: {e}")
+            return None
+
     def extract_auth_token(self):
         """Extract authorization token from the page or network requests"""
         try:
@@ -423,7 +543,6 @@ class DHGateScraper:
                     script_content = script.get_attribute('innerHTML')
                     if script_content and ('token' in script_content.lower() or 'authorization' in script_content.lower()):
                         # Look for token patterns in the script
-                        import re
                         patterns = [
                             r'token["\']?\s*[:=]\s*["\']([^"\']+)["\']',
                             r'authorization["\']?\s*[:=]\s*["\']([^"\']+)["\']',
@@ -507,10 +626,10 @@ class DHGateScraper:
             
             if response.status_code == 200:
                 logger.info("Orders fetched successfully")
-                return self.process_orders_response(response.text)
+                return self.process_orders_response(response.content)
             else:
                 logger.error(f"Failed to fetch orders. Status code: {response.status_code}")
-                logger.error(f"Response: {response.text}")
+                logger.error(f"Response: {response.content}")
                 return False
                 
         except Exception as e:
@@ -520,60 +639,145 @@ class DHGateScraper:
     def process_orders_response(self, response_text):
         """Process the orders response and download files"""
         try:
-            # Parse the response
-            response_data = json.loads(response_text)
+            # Debug: Log the raw response
+            logger.info(f"Raw response length: {len(response_text)}")
+            logger.info(f"Raw response (first 500 chars): {response_text[:500]}")
             
-            if not response_data.get('success', False):
-                error_msg = response_data.get('msg', 'Unknown error')
-                if 'no data to export' in error_msg.lower():
-                    logger.info("✅ No orders found for the specified date range. This is normal if you don't have any orders.")
-                    logger.info("The script is working correctly - it successfully logged in and accessed the API.")
-                    return True
+            # Convert bytes to string if needed
+            if isinstance(response_text, bytes):
+                response_text = response_text.decode('utf-8')
+            
+            # Handle JSON response format like PHP script
+            try:
+                response_data = json.loads(response_text)
+                
+                # Check if response has the expected JSON structure
+                if response_data.get('success', False) and response_data.get('code') == 0:
+                    csv_data = response_data.get('data', '')
+                    
+                    # If data is null/empty, it means no orders found
+                    if not csv_data or csv_data is None:
+                        logger.info("✅ No orders found for the specified date range. This is normal if you don't have any orders.")
+                        logger.info("The script is working correctly - it successfully logged in and accessed the API.")
+                        return True
+                    
+                    # Remove the success message from CSV data (like PHP script does)
+                    csv_data = csv_data.replace('{"code":0,"msg":"Success","data":null,"success":true}', '')
+                    
                 else:
-                    logger.error(f"API returned error: {error_msg}")
+                    # Handle error responses
+                    error_msg = response_data.get('msg', 'Unknown error')
+                    if 'no data to export' in error_msg.lower():
+                        logger.info("✅ No orders found for the specified date range. This is normal if you don't have any orders.")
+                        logger.info("The script is working correctly - it successfully logged in and accessed the API.")
+                        return True
+                    else:
+                        logger.error(f"API returned error: {error_msg}")
+                        return False
+                        
+            except json.JSONDecodeError:
+                # If not JSON, check if it's CSV data directly
+                if response_text.strip().startswith('Order No.,'):
+                    logger.info("Response is CSV data directly, processing...")
+                    csv_data = response_text
+                else:
+                    logger.error("Response is neither valid JSON nor CSV format")
                     return False
             
-            # Extract CSV data
-            csv_data = response_data.get('data', '')
-            if not csv_data:
-                logger.warning("No CSV data found in response")
-                return False
+           # Remove the success message from CSV data
+            csv_data = csv_data.replace('{"code":0,"msg":"Success","data":null,"success":true}', '')
             
-            # Parse CSV
+            # Split by newlines and parse each line as CSV (like PHP str_getcsv)
             csv_lines = csv_data.strip().split('\n')
             csv_reader = csv.reader(csv_lines)
             orders = list(csv_reader)
             
-            # Sort orders (rsort equivalent in Python)
-            orders.sort(reverse=True)
+            # Convert to collection where first row is column names
+            if orders:
+                # First row contains column names
+                columns = orders[0]
+                # Data rows (skip the header row)
+                data_rows = orders[1:]
+                
+                # Convert to list of dictionaries (collection)
+                orders_collection = []
+                for row in data_rows:
+                    order_dict = {}
+                    for i, value in enumerate(row):
+                        if i < len(columns):
+                            order_dict[columns[i]] = value
+                    orders_collection.append(order_dict)
+                
+                # Sort by Order No. in descending order (rsort equivalent)
+                orders_collection.sort(key=lambda x: x.get('Order No.', ''), reverse=True)
+                
+                logger.info(f"Processing {len(orders_collection)} orders")
+                logger.info(f"Available columns: {columns}")
+                
+                # Save CSV report to root folder
+                self.save_csv_report(orders_collection, columns)
+                
+                # Update orders variable to use the collection
+                orders = orders_collection
+            else:
+                logger.warning("No orders found in CSV data")
+                orders = []
             
-            logger.info(f"Processing {len(orders)} orders")
-            
-            # Process each order
-            for row in orders:
-                if len(row) >= 12:  # Ensure we have enough columns
-                    order_id = row[0]
-                    amount = row[2] if len(row) > 2 else "0"
-                    subid = row[11] if len(row) > 11 else ""
+            # Process each order (matching PHP script logic)
+            for k, order in enumerate(orders):
+                # Access order data using column names
+                order_id = order.get('Order No.', '')
+                amount = order.get('Sale Amount(USD)', '0')
+                subid = order.get('Customize1 ID', '')
+                
+                # Ensure we have the required data
+                if order_id and subid:
                     
-                    # Check if file already exists
+                    # Check if file already exists (like PHP: !file_exists())
                     file_path = os.path.join(self.download_dir, order_id)
                     if not os.path.exists(file_path):
-                        try:
-                            # Download the file
-                            download_url = f"https://izeeto.com/conv?subid={subid}&tid={order_id}&amount={amount}"
-                            logger.info(f"Downloading file for order {order_id}")
-                            
-                            response = requests.get(download_url, timeout=self.request_timeout)
-                            if response.status_code == 200:
-                                with open(file_path, 'wb') as f:
-                                    f.write(response.content)
-                                logger.info(f"File saved: {file_path}")
-                            else:
-                                logger.warning(f"Failed to download file for order {order_id}")
+                        # Download the file with retry logic
+                        download_url = f"https://izeeto.com/conv?subid={subid}&tid={order_id}&amount={amount}"
+                        logger.info(f"Downloading file for order {download_url}")
+                        logger.info(f"Downloading file for order {order_id}")
+                        
+                        # Retry logic for failed downloads
+                        max_retries = 3
+                        retry_delay = 1  # seconds
+                        
+                        for attempt in range(max_retries):
+                            try:
+                                # Use follow_all_redirects to handle the download with redirects
+                                final_content = self.follow_all_redirects(download_url, order_id, max_redirects=10)
                                 
-                        except Exception as e:
-                            logger.error(f"Error downloading file for order {order_id}: {e}")
+                                if final_content:
+                                    # Save the final content
+                                    with open(file_path, 'wb') as f:
+                                        f.write(final_content)
+                                    logger.info(f"File saved after following all redirects: {file_path}")
+                                    break  # Success, exit retry loop
+                                else:
+                                    logger.warning(f"Could not get final content after following redirects for order {order_id}")
+                                    if attempt < max_retries - 1:
+                                        logger.info(f"Retrying download for order {order_id} (attempt {attempt + 2}/{max_retries})")
+                                        time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
+                                        continue
+                                    else:
+                                        logger.error(f"Failed to download file for order {order_id} after {max_retries} attempts")
+                                        break
+                                    
+                            except Exception as e:
+                                logger.error(f"Error downloading file for order {order_id}: {e}")
+                                if attempt < max_retries - 1:
+                                    logger.info(f"Retrying download for order {order_id} (attempt {attempt + 2}/{max_retries})")
+                                    time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
+                                    continue
+                                else:
+                                    logger.error(f"Failed to download file for order {order_id} after {max_retries} attempts: {e}")
+                                    break
+                        
+                        # Add a small delay between downloads to avoid overwhelming the server
+                        time.sleep(0.5)
                     else:
                         logger.info(f"File already exists for order {order_id}")
             

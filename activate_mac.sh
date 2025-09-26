@@ -13,3 +13,4 @@ if [ -d "venv" ]; then
 else
     echo "❌ Virtual environment not found. Please run ./setup_mac.sh first."
 fi
+

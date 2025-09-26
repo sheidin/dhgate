@@ -70,3 +70,4 @@ echo "📋 Next steps:"
 echo "1. Edit .env file with your DHGate username and password"
 echo "2. Run: source venv/bin/activate"
 echo "3. Run: python main.py"
+

@@ -13,3 +13,4 @@ if exist "venv" (
     echo ❌ Virtual environment not found. Please run setup_windows.bat first.
     pause
 )
+
